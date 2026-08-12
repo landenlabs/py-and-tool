@@ -1,0 +1,37 @@
+# .gitignore python
+
+# Distribution / packaging
+.Python
+build/
+dist/
+__pycache__/
+.claude/
+.claude/**
+
+.legacy
+.legacy/**
+ 
+# Translations
+*.mo
+*.pot
+
+# PyBuilder
+.pybuilder/
+target/
+
+# Environments
+.env
+.envrc
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+tmp/
+.idea/
+
+# PyPI configuration file
+.pypirc
+
+PROFILE_DIR/
