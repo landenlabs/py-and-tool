@@ -18,7 +18,7 @@ import shutil
 import subprocess
 import sys
 
-VERSION = "v1.0.0"
+VERSION = "v6.08.10"
 
 RED = "\033[91m"
 YELLOW = "\033[93m"
