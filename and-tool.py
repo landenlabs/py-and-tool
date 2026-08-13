@@ -430,7 +430,7 @@ def _find_by_ext(directory, ext):
                 except OSError:
                     continue
                 mtime = datetime.fromtimestamp(st.st_mtime).strftime("%b %d %H:%M:%S %Y")
-                rows.append((name, str(st.st_size), mtime, path))
+                rows.append((name, f"{st.st_size:,}", mtime, path))
     rows.sort(key=lambda row: row[0].lower())
     return rows
 
@@ -443,7 +443,7 @@ def _print_file_list(directory, ext, label):
         return
     widths = [max(len(row[i]) for row in rows) for i in range(3)]
     for name, size, mtime, path in rows:
-        print(f"  {name.ljust(widths[0])}  {size.ljust(widths[1])}  {mtime.ljust(widths[2])}  {path}")
+        print(f"  {name.ljust(widths[0])}  {size.rjust(widths[1])}  {mtime.ljust(widths[2])}  {path}")
 
 
 def _find_apks(root, needle=None):
