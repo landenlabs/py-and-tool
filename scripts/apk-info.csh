@@ -10,7 +10,7 @@ endif
 # echo "#file=$#argv"
 # set file1=$1
 # echo $*
-set path=( $path /Users/dennislang/Library/Android/sdk/build-tools/36.0.0 )
+set path=( $path ~/Library/Android/sdk/build-tools/37.0.0 )
 
 foreach apk ($*)
    echo "$apk "
