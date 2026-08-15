@@ -20,7 +20,7 @@ import sys
 import tempfile
 from datetime import datetime
 
-VERSION = "v6.08.10"
+VERSION = "v6.08.11"
 
 RED = "\033[91m"
 YELLOW = "\033[93m"
