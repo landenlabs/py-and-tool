@@ -439,6 +439,22 @@ def apk_info(apk_path):
             print(f"    {line.strip()}")
 
 
+def _format_age(mtime_ts):
+    """Formats a mtime as: 'MMM dd yyyy' if >30 days old, '#days'/'#hours'/'#mins' otherwise."""
+    delta = datetime.now() - datetime.fromtimestamp(mtime_ts)
+    seconds = delta.total_seconds()
+    days = seconds / 86400
+    if days > 30:
+        return datetime.fromtimestamp(mtime_ts).strftime("%b %d %Y")
+    if days > 2:
+        return f"{int(days)} days"
+    hours = seconds / 3600
+    if hours > 1:
+        return f"{int(hours)} hours"
+    minutes = seconds / 60
+    return f"{max(0, int(minutes))} mins"
+
+
 def _find_by_ext(directory, ext):
     """Recursively finds files under directory ending in ext (mirrors find-apk.csh's `find . -name *.ext`)."""
     rows = []
@@ -450,7 +466,7 @@ def _find_by_ext(directory, ext):
                     st = os.stat(path)
                 except OSError:
                     continue
-                mtime = datetime.fromtimestamp(st.st_mtime).strftime("%b %d %H:%M:%S %Y")
+                mtime = _format_age(st.st_mtime)
                 rows.append((name, f"{st.st_size:,}", mtime, path))
     rows.sort(key=lambda row: row[0].lower())
     return rows
