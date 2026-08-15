@@ -188,9 +188,11 @@ class ADBTool:
             print(f"{pkg}\n  {version.strip()}\n  {last_update.strip()}\n")
 
     def install(self, target):
+        """Installs an apk, returning the installed package name on success, or
+        None if resolution failed, the user declined, or the install ultimately failed."""
         apk = _resolve_apk_to_install(target)
         if not apk:
-            return
+            return None
 
         pkg_name = _get_apk_package_name(apk)
         installed = bool(pkg_name and pkg_name in self._get_packages(pkg_name))
@@ -204,7 +206,7 @@ class ADBTool:
             answer = input(colored(f"Install {apk} over existing {pkg_name}? [y/N]: ", YELLOW)).strip().lower()
             if answer != "y":
                 print("Skipping install.")
-                return
+                return None
             if sig_mismatch:
                 self._uninstall_pkg(pkg_name)
 
@@ -215,7 +217,26 @@ class ADBTool:
             if answer == "y":
                 self._uninstall_pkg(pkg_name)
                 print(f"Retrying install of {apk} ...")
-                self._install_apk(apk)
+                output = self._install_apk(apk)
+
+        return pkg_name if "Success" in output else None
+
+    def start(self, pattern):
+        """Launches an installed app matching pattern (case-insensitive substring
+        on package name); prompts to choose when multiple packages match."""
+        matches = self._get_packages(pattern)
+        if not matches:
+            print(colored(f"No installed package matches '{pattern}'.", RED))
+            return
+        pkg = matches[0] if len(matches) == 1 else _prompt_pkg_choice(matches)
+        if pkg:
+            self.launch(pkg)
+
+    def launch(self, pkg):
+        """Launches pkg's default activity via the monkey trick, avoiding the need
+        to know its launch activity's class name."""
+        print(f"Starting {pkg} ...")
+        self._run_cmd(["shell", "monkey", "-p", pkg, "-c", "android.intent.category.LAUNCHER", "1"], capture=False)
 
     def _install_apk(self, apk):
         """Runs adb install, printing and returning its combined stdout+stderr."""
@@ -486,6 +507,22 @@ def _prompt_apk_choice(matches):
     return None
 
 
+def _prompt_pkg_choice(matches):
+    """Numbered prompt (1-based) for selecting one of several matching packages."""
+    print(colored("--- Multiple packages found ---", YELLOW))
+    for i, pkg in enumerate(matches, 1):
+        print(f"  {i}  {pkg}")
+    choice = input(f"Enter # (1..{len(matches)}): ").strip()
+    try:
+        idx = int(choice)
+        if 1 <= idx <= len(matches):
+            return matches[idx - 1]
+    except ValueError:
+        pass
+    print(colored("Invalid selection.", RED))
+    return None
+
+
 def _resolve_apk_to_install(target):
     """Resolves --install's argument to a single .apk path: a full path installs
     directly; a directory searches it for every .apk; anything else is treated as
@@ -565,21 +602,35 @@ def main():
             and-tool.py --install build/
             and-tool.py --install debug
             and-tool.py --install build/debug/debug.apk
+        Launch an installed app (only launches if the pattern matches a single
+        package, otherwise prompts to choose which one; add --start to --install to
+        launch the just-installed apk, or use --start alone with no pattern to
+        install from the current directory and then launch it):
+            and-tool.py --start com.full.package.name
+            and-tool.py --start full
+            and-tool.py --install --start
+            and-tool.py --start
 
     Action flags accept any unambiguous prefix, e.g. --info, --inf, --i
     """,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
-    actions = parser.add_mutually_exclusive_group(required=True)
+    actions = parser.add_mutually_exclusive_group(required=False)
     for name in ("uninstall", "packages", "info", "stop-and-clear", "clear", "trace", "encode", "decode", "list-apk", "list-aar", "list", "install"):
         actions.add_argument(f"--{name}", dest="action", action="store_const", const=name, help=f"{name} action (accepts any unambiguous prefix)")
 
     parser.add_argument("pattern", nargs="?", default="", help="Partial package name (substring match, case-insensitive), a path to a local .apk file for --info/--install, a directory to search for --list/--list-apk/--list-aar/--install (defaults to '.'), or a partial .apk filename for --install. Defaults to matching every installed package")
+    parser.add_argument("--start", action="store_true", help="Launch an installed app matching pattern. With --install, launches the just-installed apk instead of matching pattern against installed packages. Alone with no pattern, installs an apk found under '.' first, then launches it")
     parser.add_argument("--verbose", "-v", action="store_true", help="With --info, show fuller dumpsys breakdown: activities, permissions, flags")
     parser.add_argument("--version", "-V", action="version", version=f"and-tool {VERSION}")
 
     args = parser.parse_args()
+
+    if not args.action and not args.start:
+        parser.error("one of the action arguments is required")
+    if args.start and args.action and args.action != "install":
+        parser.error("--start can only be combined with --install")
 
     if args.action == "encode":
         return do_encode()
@@ -610,7 +661,16 @@ def main():
     elif args.action == "trace":
         tool.trace()
     elif args.action == "install":
-        tool.install(args.pattern)
+        pkg = tool.install(args.pattern)
+        if pkg and args.start:
+            tool.launch(pkg)
+    elif args.start:
+        if args.pattern:
+            tool.start(args.pattern)
+        else:
+            pkg = tool.install(args.pattern)
+            if pkg:
+                tool.launch(pkg)
 
 
 if __name__ == "__main__":
