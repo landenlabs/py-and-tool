@@ -48,6 +48,17 @@ crash traces from logcat, and base64 encode/decode stdin.
   - `--trace` — show `FATAL EXCEPTION` crash traces from logcat, falling back to
     generic `java` error lines when there are none.
   - `--encode` / `--decode` — base64 encode/decode stdin, one line at a time.
+  - `--summary` — scans one or more directory trees (no device needed, defaults to
+    `.`) and prints one report per Android Gradle project found: module list,
+    `namespace`/`applicationId`/`compileSdk`/`targetSdk`/`versionCode`/`versionName`
+    per module, AGP and Gradle versions, and the newest `build.gradle` modification
+    date. Only `--summary` accepts more than one directory argument. Each argument
+    is glob-expanded internally (so `dir*` works even on shells like Windows
+    cmd.exe/PowerShell that don't expand wildcards themselves), and overlapping
+    directories are deduped. When more than one project is found, a final
+    aggregate block reports project/module counts and a count-per-value breakdown
+    of AGP version, Gradle version, `compileSdk`, and `targetSdk` across all
+    projects/modules.
 - **Standard CLI.** `--version`, `--help` with usage examples. Action flags accept
   any unambiguous prefix (e.g. `--info`, `--inf`, `--i`).
 
@@ -107,6 +118,8 @@ and-tool.py --uninstall 'wx2'
 and-tool.py --trace
 and-tool.py --clear
 and-tool.py --encode < input.txt
+and-tool.py --summary
+and-tool.py --summary dir1 dir2
 ```
 
 The `pattern` argument defaults to `""`, matching every installed package, for any
@@ -125,6 +138,7 @@ action that needs one.
 | `--trace` | Show recent crash traces from logcat |
 | `--encode` | Base64 encode stdin, one line at a time |
 | `--decode` | Base64 decode stdin, one line at a time |
+| `--summary` | Per-project reports for Android Gradle projects found under `pattern` (a directory, defaults to `.`) — no device needed |
 | `--version` | Print version and exit |
 | `--help` | Show full usage and examples |
 

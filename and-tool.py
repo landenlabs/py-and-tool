@@ -12,12 +12,14 @@ packages() implementation.
 
 import argparse
 import base64
+import glob
 import os
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+from collections import Counter
 from datetime import datetime
 
 VERSION = "v6.08.11"
@@ -572,6 +574,277 @@ def list_all(directory):
     list_apk(directory)
 
 
+# ---------------------------------------------------------------------------
+# --summary: per-project reports for build.gradle Android projects
+# ---------------------------------------------------------------------------
+
+GRADLE_SKIP_DIRS = {".git", ".gradle", ".idea", "build", "node_modules", "out"}
+
+_AGP_VERSION_PATTERNS = (
+    re.compile(r'com\.android\.tools\.build:gradle:([0-9][\w.\-]*)'),
+    re.compile(r'id\s*\(?\s*["\']com\.android\.(?:application|library|base)["\']\s*\)?\s*version\s*["\']([0-9][\w.\-]*)["\']'),
+)
+
+
+def _read_text(path):
+    if not path:
+        return ""
+    try:
+        with open(path, encoding="utf-8", errors="ignore") as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
+def _resolve_gradle_file(directory, stem):
+    """Returns the first of stem.gradle.kts / stem.gradle found in directory, or None."""
+    for name in (f"{stem}.gradle.kts", f"{stem}.gradle"):
+        path = os.path.join(directory, name)
+        if os.path.isfile(path):
+            return path
+    return None
+
+
+def _has_android_block(text):
+    return bool(re.search(r'\bandroid\s*\{', text))
+
+
+def _find_gradle_projects(root):
+    """Recursively finds Android Gradle project roots under root.
+
+    A project root is a directory containing settings.gradle(.kts) (its modules
+    come from that file's include(...) statements), or -- absent that -- a
+    standalone directory whose build.gradle(.kts) declares an android {} block.
+    Does not descend further once a project root is found, so a project's own
+    modules aren't also reported as separate top-level projects.
+    """
+    projects = []
+    for dirpath, dirnames, _filenames in os.walk(root):
+        dirnames[:] = sorted(d for d in dirnames if d not in GRADLE_SKIP_DIRS)
+        if _resolve_gradle_file(dirpath, "settings"):
+            projects.append(dirpath)
+            dirnames[:] = []
+            continue
+        build_file = _resolve_gradle_file(dirpath, "build")
+        if build_file and _has_android_block(_read_text(build_file)):
+            projects.append(dirpath)
+            dirnames[:] = []
+    return projects
+
+
+def _parse_settings_modules(text):
+    """Extracts module paths from include(...) statements, Groovy (include ':app',
+    ':lib') and Kotlin DSL (include("app")) alike, including multi-line lists."""
+    modules = []
+    for call in re.finditer(r'\binclude\s*\(?\s*((?:["\'][^"\']+["\']\s*,?\s*)+)\)?', text):
+        for name in re.finditer(r'["\']([^"\']+)["\']', call.group(1)):
+            modules.append(name.group(1).lstrip(":"))
+    return modules
+
+
+def _parse_module_gradle(text):
+    """Extracts common android{} fields from a module's build.gradle(.kts) text."""
+    def find(pattern):
+        m = re.search(pattern, text)
+        return m.group(1) if m else None
+
+    is_app = bool(re.search(
+        r'(id\s*\(?\s*["\']com\.android\.application["\']|apply\s+plugin:\s*["\']com\.android\.application["\'])',
+        text,
+    ))
+    return {
+        "is_app": is_app,
+        "namespace": find(r'namespace\s*=?\s*["\']([^"\']+)["\']'),
+        "applicationId": find(r'applicationId\s*=?\s*["\']([^"\']+)["\']'),
+        "compileSdk": find(r'compileSdk(?:Version)?\s*=?\s*(\d+)'),
+        "targetSdk": find(r'targetSdk(?:Version)?\s*=?\s*(\d+)'),
+        "versionCode": find(r'versionCode\s*=?\s*(\d+)'),
+        "versionName": find(r'versionName\s*=?\s*["\']([^"\']+)["\']'),
+    }
+
+
+def _find_agp_version(texts, root):
+    """Searches buildscript classpath / plugins-DSL version declarations first,
+    falling back to gradle/libs.versions.toml's [versions] agp entry."""
+    for text in texts:
+        for pattern in _AGP_VERSION_PATTERNS:
+            match = pattern.search(text)
+            if match:
+                return match.group(1)
+    toml_text = _read_text(os.path.join(root, "gradle", "libs.versions.toml"))
+    match = re.search(r'^\s*agp\s*=\s*["\']([0-9][\w.\-]*)["\']', toml_text, re.MULTILINE)
+    return match.group(1) if match else None
+
+
+def _find_gradle_version(root):
+    props_text = _read_text(os.path.join(root, "gradle", "wrapper", "gradle-wrapper.properties"))
+    match = re.search(r'gradle-([0-9][\w.\-]*)-(?:bin|all)\.zip', props_text)
+    return match.group(1) if match else None
+
+
+def _record_mtime(mtimes, path):
+    try:
+        mtimes.append(os.path.getmtime(path))
+    except OSError:
+        pass
+
+
+_MODULE_FIELDS = ("namespace", "applicationId", "compileSdk", "targetSdk", "versionCode", "versionName")
+
+
+def _print_module_fields(info):
+    present = [(label, info[label]) for label in _MODULE_FIELDS if info.get(label) is not None]
+    if not present:
+        print("      (none)")
+        return
+    width = max(len(label) for label, _value in present)
+    for label, value in present:
+        print(f"      {(label + ':').ljust(width + 1)} {value}")
+
+
+def print_gradle_summary(root, module_names, modules_info, agp_version, gradle_version, last_mod_ts):
+    print(colored(f"==== {root} ====", YELLOW))
+    print(f"  Last modified:  {_format_age(last_mod_ts) if last_mod_ts else 'unknown'}")
+    print(f"  Modules:        [{', '.join(module_names)}]")
+    print(f"  AGP version:    {agp_version or 'unknown'}")
+    print(f"  Gradle version: {gradle_version or 'unknown'}")
+    for name, info in modules_info:
+        print(colored(f"  {name}", CYAN))
+        _print_module_fields(info)
+    print()
+
+
+def _print_gradle_project_summary(root):
+    """Builds and prints one project's report: module list, sdk/version fields
+    (one line per module that defines the field), AGP/Gradle versions, and the
+    newest mtime across the project's build.gradle files. Returns
+    (module_count, agp_version, gradle_version, modules_info) for --summary's
+    final aggregate report across projects."""
+    settings_file = _resolve_gradle_file(root, "settings")
+    if settings_file:
+        module_names = _parse_settings_modules(_read_text(settings_file)) or ["."]
+        module_dirs = [(name, os.path.join(root, name.replace(":", os.sep))) for name in module_names]
+    else:
+        module_dirs = [(os.path.basename(os.path.abspath(root)) or root, root)]
+
+    gradle_texts = []
+    modules_info = []
+    mtimes = []
+
+    root_build_file = _resolve_gradle_file(root, "build")
+    if root_build_file:
+        gradle_texts.append(_read_text(root_build_file))
+        _record_mtime(mtimes, root_build_file)
+
+    for name, module_dir in module_dirs:
+        build_file = _resolve_gradle_file(module_dir, "build")
+        if not build_file:
+            modules_info.append((name, {}))
+            continue
+        text = _read_text(build_file)
+        gradle_texts.append(text)
+        modules_info.append((name, _parse_module_gradle(text)))
+        _record_mtime(mtimes, build_file)
+
+    agp_version = _find_agp_version(gradle_texts, root)
+    gradle_version = _find_gradle_version(root)
+    last_mod = max(mtimes) if mtimes else None
+
+    print_gradle_summary(root, [name for name, _dir in module_dirs], modules_info, agp_version, gradle_version, last_mod)
+    return len(module_dirs), agp_version, gradle_version, modules_info
+
+
+def _natural_sort_key(value):
+    """Sorts dotted version-like strings ('8.9.2' < '9.4.1') and plain integers
+    ('35' < '36') numerically instead of lexically."""
+    return [int(part) if part.isdigit() else part for part in re.split(r'(\d+)', value)]
+
+
+def _format_value_counts(counter):
+    if not counter:
+        return "(none)"
+    items = sorted(counter.items(), key=lambda kv: _natural_sort_key(kv[0]))
+    return ", ".join(f"{value}({count})" for value, count in items)
+
+
+def print_gradle_overall_summary(project_count, module_count, agp_counts, gradle_counts, compile_sdk_counts, target_sdk_counts):
+    print(colored("==== Summary ====", YELLOW))
+    print(f"  Number of projects: {project_count}")
+    print(f"  Number of modules:  {module_count}")
+    print(f"  AGP version:        {_format_value_counts(agp_counts)}")
+    print(f"  Gradle version:     {_format_value_counts(gradle_counts)}")
+    print(f"  Compile Sdk:        {_format_value_counts(compile_sdk_counts)}")
+    print(f"  Target Sdk:         {_format_value_counts(target_sdk_counts)}")
+
+
+def _expand_dir_patterns(patterns):
+    """Expands each pattern to existing directories via glob, so wildcards (e.g.
+    'dir*') work even on shells that don't expand them themselves -- notably
+    Windows cmd.exe/PowerShell, unlike bash/zsh. A literal directory name with no
+    wildcard just matches itself. Returns (dirs, unmatched_patterns), both deduped/
+    ordered by first encounter (dirs by real path)."""
+    seen = set()
+    dirs = []
+    unmatched = []
+    for pattern in patterns:
+        matches = [p for p in sorted(glob.glob(pattern)) if os.path.isdir(p)]
+        if not matches:
+            unmatched.append(pattern)
+            continue
+        for path in matches:
+            real = os.path.realpath(path)
+            if real not in seen:
+                seen.add(real)
+                dirs.append(path)
+    return dirs, unmatched
+
+
+def summary(directories):
+    """Scans each directory tree in `directories` (globs expanded via
+    _expand_dir_patterns) for Android Gradle projects (see _find_gradle_projects)
+    and prints one report per project found, deduped by real path in case the
+    given directories overlap."""
+    dirs, unmatched = _expand_dir_patterns(directories)
+    for pattern in unmatched:
+        print(colored(f"No directory matches '{pattern}'.", RED))
+
+    seen = set()
+    roots = []
+    for directory in dirs:
+        for root in _find_gradle_projects(directory):
+            real = os.path.realpath(root)
+            if real not in seen:
+                seen.add(real)
+                roots.append(root)
+
+    if not roots:
+        if dirs:
+            print(colored(f"No build.gradle android projects found under {', '.join(dirs)}.", RED))
+        return
+
+    module_count = 0
+    agp_counts = Counter()
+    gradle_counts = Counter()
+    compile_sdk_counts = Counter()
+    target_sdk_counts = Counter()
+
+    for root in sorted(roots):
+        project_modules, agp_version, gradle_version, modules_info = _print_gradle_project_summary(root)
+        module_count += project_modules
+        if agp_version:
+            agp_counts[agp_version] += 1
+        if gradle_version:
+            gradle_counts[gradle_version] += 1
+        for _name, info in modules_info:
+            if info.get("compileSdk"):
+                compile_sdk_counts[info["compileSdk"]] += 1
+            if info.get("targetSdk"):
+                target_sdk_counts[info["targetSdk"]] += 1
+
+    if len(roots) > 1:
+        print_gradle_overall_summary(len(roots), module_count, agp_counts, gradle_counts, compile_sdk_counts, target_sdk_counts)
+
+
 def do_encode():
     """Base64 encode stdin, one line at a time."""
     for line in sys.stdin:
@@ -609,6 +882,12 @@ def main():
             and-tool.py --list
             and-tool.py --list-apk build/
             and-tool.py --list-aar build/
+        Report module list, sdk/version fields, AGP/Gradle versions, and last
+        build.gradle modification date for every Android project found under the
+        current (or given) director(ies):
+            and-tool.py --summary
+            and-tool.py --summary ~/projects
+            and-tool.py --summary dir1 dir2
         Install an apk (searches and prompts if there are multiple matches; if the
         apk's package is already installed, shows its --info summary and asks to
         confirm. If the installed and new apk are signed with different certs,
@@ -633,10 +912,10 @@ def main():
     )
 
     actions = parser.add_mutually_exclusive_group(required=False)
-    for name in ("uninstall", "packages", "info", "stop-and-clear", "clear", "trace", "encode", "decode", "list-apk", "list-aar", "list", "install"):
+    for name in ("uninstall", "packages", "info", "stop-and-clear", "clear", "trace", "encode", "decode", "list-apk", "list-aar", "list", "install", "summary"):
         actions.add_argument(f"--{name}", dest="action", action="store_const", const=name, help=f"{name} action (accepts any unambiguous prefix)")
 
-    parser.add_argument("pattern", nargs="?", default="", help="Partial package name (substring match, case-insensitive), a path to a local .apk file for --info/--install, a directory to search for --list/--list-apk/--list-aar/--install (defaults to '.'), or a partial .apk filename for --install. Defaults to matching every installed package")
+    parser.add_argument("patterns", nargs="*", default=[], help="Partial package name (substring match, case-insensitive), a path to a local .apk file for --info/--install, a directory to search for --list/--list-apk/--list-aar/--install (defaults to '.'), one or more directories to search for --summary (defaults to '.'), or a partial .apk filename for --install. Defaults to matching every installed package")
     parser.add_argument("--start", action="store_true", help="Launch an installed app matching pattern. With --install, launches the just-installed apk instead of matching pattern against installed packages. Alone with no pattern, installs an apk found under '.' first, then launches it")
     parser.add_argument("--verbose", "-v", action="store_true", help="With --info, show fuller dumpsys breakdown: activities, permissions, flags")
     parser.add_argument("--version", "-V", action="version", version=f"and-tool {VERSION}")
@@ -647,44 +926,50 @@ def main():
         parser.error("one of the action arguments is required")
     if args.start and args.action and args.action != "install":
         parser.error("--start can only be combined with --install")
+    if len(args.patterns) > 1 and args.action != "summary":
+        parser.error("only --summary accepts more than one directory argument")
 
     if args.action == "encode":
         return do_encode()
     if args.action == "decode":
         return do_decode()
 
-    if args.action == "info" and args.pattern and args.pattern.lower().endswith(".apk") and os.path.isfile(args.pattern):
-        return apk_info(args.pattern)
+    pattern = args.patterns[0] if args.patterns else ""
+
+    if args.action == "info" and pattern and pattern.lower().endswith(".apk") and os.path.isfile(pattern):
+        return apk_info(pattern)
 
     if args.action == "list-apk":
-        return list_apk(args.pattern or ".")
+        return list_apk(pattern or ".")
     if args.action == "list-aar":
-        return list_aar(args.pattern or ".")
+        return list_aar(pattern or ".")
     if args.action == "list":
-        return list_all(args.pattern or ".")
+        return list_all(pattern or ".")
+    if args.action == "summary":
+        return summary(args.patterns or ["."])
 
     tool = ADBTool()
     if args.action == "uninstall":
-        tool.uninstall(args.pattern)
+        tool.uninstall(pattern)
     elif args.action == "packages":
-        tool.packages(args.pattern)
+        tool.packages(pattern)
     elif args.action == "info":
-        tool.info(args.pattern, verbose=args.verbose)
+        tool.info(pattern, verbose=args.verbose)
     elif args.action == "stop-and-clear":
-        tool.stop_and_clear(args.pattern)
+        tool.stop_and_clear(pattern)
     elif args.action == "clear":
         tool.clear_logs()
     elif args.action == "trace":
         tool.trace()
     elif args.action == "install":
-        pkg = tool.install(args.pattern)
+        pkg = tool.install(pattern)
         if pkg and args.start:
             tool.launch(pkg)
     elif args.start:
-        if args.pattern:
-            tool.start(args.pattern)
+        if pattern:
+            tool.start(pattern)
         else:
-            pkg = tool.install(args.pattern)
+            pkg = tool.install(pattern)
             if pkg:
                 tool.launch(pkg)
 
