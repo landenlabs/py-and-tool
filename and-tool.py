@@ -19,6 +19,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from collections import Counter
 from datetime import datetime
 
@@ -239,6 +240,26 @@ class ADBTool:
         to know its launch activity's class name."""
         print(f"Starting {pkg} ...")
         self._run_cmd(["shell", "monkey", "-p", pkg, "-c", "android.intent.category.LAUNCHER", "1"], capture=False)
+
+    def wifi_adb(self, enable):
+        """Toggles adb-over-wifi on the connected device. Enabling switches adbd
+        to tcpip mode and connects to the device's wlan0 IP on port 5555;
+        disabling switches the device back to USB mode."""
+        if enable:
+            ip_out = self._run_cmd(["shell", "ip", "-f", "inet", "addr", "show", "wlan0"])
+            match = re.search(r"inet (\d+\.\d+\.\d+\.\d+)", ip_out)
+            if not match:
+                print(colored("Could not determine device wifi IP (is wlan0 connected?).", RED))
+                return
+            addr = match.group(1)
+            print(f"Switching {' '.join(self.adb_cmd)} to tcpip mode on port 5555...")
+            self._run_cmd(["tcpip", "5555"], capture=False)
+            time.sleep(1)
+            print(f"Connecting to {addr}:5555 ...")
+            subprocess.run(["adb", "connect", f"{addr}:5555"])
+        else:
+            print(f"Switching {' '.join(self.adb_cmd)} back to USB mode...")
+            self._run_cmd(["usb"], capture=False)
 
     def _install_apk(self, apk):
         """Runs adb install, printing and returning its combined stdout+stderr."""
@@ -905,6 +926,11 @@ def main():
             and-tool.py --start full
             and-tool.py --install --start
             and-tool.py --start
+        Enable or disable adb over wifi on the connected (USB) device (combine
+        with --start to launch an app right after toggling):
+            and-tool.py --wifi-adb on
+            and-tool.py --wifi-adb off
+            and-tool.py --wifi-adb on --start full
 
     Action flags accept any unambiguous prefix, e.g. --info, --inf, --i
     """,
@@ -914,6 +940,7 @@ def main():
     actions = parser.add_mutually_exclusive_group(required=False)
     for name in ("uninstall", "packages", "info", "stop-and-clear", "clear", "trace", "encode", "decode", "list-apk", "list-aar", "list", "install", "summary"):
         actions.add_argument(f"--{name}", dest="action", action="store_const", const=name, help=f"{name} action (accepts any unambiguous prefix)")
+    actions.add_argument("--wifi-adb", dest="wifi_adb", choices=["on", "off"], help="Enable or disable adb over wifi on the connected device. Can be combined with --start to launch an app right after toggling")
 
     parser.add_argument("patterns", nargs="*", default=[], help="Partial package name (substring match, case-insensitive), a path to a local .apk file for --info/--install, a directory to search for --list/--list-apk/--list-aar/--install (defaults to '.'), one or more directories to search for --summary (defaults to '.'), or a partial .apk filename for --install. Defaults to matching every installed package")
     parser.add_argument("--start", action="store_true", help="Launch an installed app matching pattern. With --install, launches the just-installed apk instead of matching pattern against installed packages. Alone with no pattern, installs an apk found under '.' first, then launches it")
@@ -922,7 +949,7 @@ def main():
 
     args = parser.parse_args()
 
-    if not args.action and not args.start:
+    if not args.action and not args.start and not args.wifi_adb:
         parser.error("one of the action arguments is required")
     if args.start and args.action and args.action != "install":
         parser.error("--start can only be combined with --install")
@@ -949,6 +976,11 @@ def main():
         return summary(args.patterns or ["."])
 
     tool = ADBTool()
+    if args.wifi_adb:
+        tool.wifi_adb(args.wifi_adb == "on")
+        if not args.start:
+            return
+
     if args.action == "uninstall":
         tool.uninstall(pattern)
     elif args.action == "packages":
