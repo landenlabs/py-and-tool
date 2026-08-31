@@ -866,6 +866,69 @@ def summary(directories):
         print_gradle_overall_summary(len(roots), module_count, agp_counts, gradle_counts, compile_sdk_counts, target_sdk_counts)
 
 
+def _find_gradle_clean_targets(root):
+    """Finds directories to run `gradlew clean` in, one level deep: for each
+    subdirectory of root, checks it for build.gradle(.kts); if absent, checks
+    one level further into its own subdirectories. Stops descending a branch
+    as soon as a build.gradle(.kts) is found there."""
+    targets = []
+    for name in sorted(os.listdir(root)):
+        path = os.path.join(root, name)
+        if not os.path.isdir(path) or name in GRADLE_SKIP_DIRS:
+            continue
+        if _resolve_gradle_file(path, "build"):
+            targets.append(path)
+            continue
+        for sub_name in sorted(os.listdir(path)):
+            sub_path = os.path.join(path, sub_name)
+            if not os.path.isdir(sub_path) or sub_name in GRADLE_SKIP_DIRS:
+                continue
+            if _resolve_gradle_file(sub_path, "build"):
+                targets.append(sub_path)
+
+    return targets
+
+
+def _run_gradle_clean(directory):
+    """Runs the project's gradlew wrapper (gradlew.bat on Windows, ./gradlew
+    elsewhere) with the `clean` task in directory; warns and skips if the
+    wrapper is missing."""
+    wrapper_name = "gradlew.bat" if os.name == "nt" else "gradlew"
+    if not os.path.isfile(os.path.join(directory, wrapper_name)):
+        print(colored(f"No {wrapper_name} found in {directory}, skipping.", RED))
+        return
+    print(colored(f"==== {directory} ====", YELLOW))
+    wrapper = wrapper_name if os.name == "nt" else f"./{wrapper_name}"
+    subprocess.run(f"{wrapper} clean", cwd=directory, shell=True)
+
+
+def clean_gradle(directories):
+    """Scans each directory tree in `directories` (globs expanded via
+    _expand_dir_patterns) one level deep for build.gradle(.kts) projects (see
+    _find_gradle_clean_targets) and runs `gradlew clean` in each, deduped by
+    real path in case the given directories overlap."""
+    dirs, unmatched = _expand_dir_patterns(directories)
+    for pattern in unmatched:
+        print(colored(f"No directory matches '{pattern}'.", RED))
+
+    seen = set()
+    targets = []
+    for directory in dirs:
+        for target in _find_gradle_clean_targets(directory):
+            real = os.path.realpath(target)
+            if real not in seen:
+                seen.add(real)
+                targets.append(target)
+
+    if not targets:
+        if dirs:
+            print(colored(f"No build.gradle project found one level deep under {', '.join(dirs)}.", RED))
+        return
+
+    for target in sorted(targets):
+        _run_gradle_clean(target)
+
+
 def do_encode():
     """Base64 encode stdin, one line at a time."""
     for line in sys.stdin:
@@ -909,6 +972,12 @@ def main():
             and-tool.py --summary
             and-tool.py --summary ~/projects
             and-tool.py --summary dir1 dir2
+        Run './gradlew clean' for every Android project found one directory
+        level deep under the current (default) or given director(ies); repeat
+        --clean-gradle to scan more than one directory:
+            and-tool.py --clean-gradle
+            and-tool.py --clean-gradle ~/projects
+            and-tool.py --clean-gradle dir1 --clean-gradle dir2
         Install an apk (searches and prompts if there are multiple matches; if the
         apk's package is already installed, shows its --info summary and asks to
         confirm. If the installed and new apk are signed with different certs,
@@ -939,22 +1008,43 @@ def main():
 
     actions = parser.add_mutually_exclusive_group(required=False)
     for name in ("uninstall", "packages", "info", "stop-and-clear", "clear", "trace", "encode", "decode", "list-apk", "list-aar", "list", "install", "summary"):
-        actions.add_argument(f"--{name}", dest="action", action="store_const", const=name, help=f"{name} action (accepts any unambiguous prefix)")
+        if name == "info":
+            help_text = "info action using adb, or aapt for a local .apk file (accepts any unambiguous prefix)"
+        elif name in ("uninstall", "packages", "stop-and-clear", "clear", "trace", "install"):
+            help_text = f"{name} action using adb (accepts any unambiguous prefix)"
+        else:
+            help_text = f"{name} action (accepts any unambiguous prefix)"
+        actions.add_argument(f"--{name}", dest="action", action="store_const", const=name, help=help_text)
     actions.add_argument("--wifi-adb", dest="wifi_adb", choices=["on", "off"], help="Enable or disable adb over wifi on the connected device. Can be combined with --start to launch an app right after toggling")
+    actions.add_argument(
+        "--clean-gradle",
+        dest="clean_gradle_dirs",
+        nargs="?",
+        const=".",
+        action="append",
+        default=None,
+        metavar="DIR",
+        help="clean-gradle action: scans DIR (default '.') one level deep for build.gradle projects and runs 'gradlew clean' in each; repeat --clean-gradle DIR to scan multiple directories",
+    )
 
     parser.add_argument("patterns", nargs="*", default=[], help="Partial package name (substring match, case-insensitive), a path to a local .apk file for --info/--install, a directory to search for --list/--list-apk/--list-aar/--install (defaults to '.'), one or more directories to search for --summary (defaults to '.'), or a partial .apk filename for --install. Defaults to matching every installed package")
-    parser.add_argument("--start", action="store_true", help="Launch an installed app matching pattern. With --install, launches the just-installed apk instead of matching pattern against installed packages. Alone with no pattern, installs an apk found under '.' first, then launches it")
+    parser.add_argument("--start", action="store_true", help="Launch an installed app using adb, matching pattern. With --install, launches the just-installed apk instead of matching pattern against installed packages. Alone with no pattern, installs an apk found under '.' first, then launches it")
     parser.add_argument("--verbose", "-v", action="store_true", help="With --info, show fuller dumpsys breakdown: activities, permissions, flags")
     parser.add_argument("--version", "-V", action="version", version=f"and-tool {VERSION}")
 
     args = parser.parse_args()
 
-    if not args.action and not args.start and not args.wifi_adb:
+    if not args.action and not args.start and not args.wifi_adb and args.clean_gradle_dirs is None:
         parser.error("one of the action arguments is required")
     if args.start and args.action and args.action != "install":
         parser.error("--start can only be combined with --install")
     if len(args.patterns) > 1 and args.action != "summary":
         parser.error("only --summary accepts more than one directory argument")
+    if args.clean_gradle_dirs is not None and args.patterns:
+        parser.error("--clean-gradle takes its directories via repeated '--clean-gradle DIR', not positional arguments")
+
+    if args.clean_gradle_dirs is not None:
+        return clean_gradle(args.clean_gradle_dirs)
 
     if args.action == "encode":
         return do_encode()
