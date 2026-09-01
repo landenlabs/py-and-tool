@@ -46,7 +46,13 @@ crash traces from logcat, and base64 encode/decode stdin.
     each one's app-details settings screen.
   - `--clear` — clear the device's logcat buffer.
   - `--trace` — show `FATAL EXCEPTION` crash traces from logcat, falling back to
-    generic `java` error lines when there are none.
+    generic `java` error lines when there are none. Repeated occurrences of the
+    same crash (ignoring the PID, which changes each run) are collapsed to just
+    the most recent occurrence, preceded by a count of how many times it
+    occurred. Repeat `--trace PATTERN` to only show traces whose text contains
+    PATTERN (multiple `--trace` values are OR'd together), or `--trace
+    "!PATTERN"` to exclude traces containing PATTERN; include and exclude
+    filters can be combined.
   - `--encode` / `--decode` — base64 encode/decode stdin, one line at a time.
   - `--summary` — scans one or more directory trees (no device needed, defaults to
     `.`) and prints one report per Android Gradle project found: module list,
@@ -116,6 +122,8 @@ and-tool.py --info build/debug/debug.apk
 and-tool.py --stop-and-clear 'atak'
 and-tool.py --uninstall 'wx2'
 and-tool.py --trace
+and-tool.py --trace com.foo --trace com.bar
+and-tool.py --trace "!com.foo"
 and-tool.py --clear
 and-tool.py --encode < input.txt
 and-tool.py --summary
@@ -135,7 +143,7 @@ action that needs one.
 | `--uninstall` | Force-stop, clear data, and uninstall matching packages |
 | `--stop-and-clear` | Force-stop and clear data, then open app-details settings |
 | `--clear` | Clear the device's logcat buffer |
-| `--trace` | Show recent crash traces from logcat |
+| `--trace [!]PATTERN` | Show recent crash traces from logcat, deduped to the most recent occurrence of each (repeatable; optional include/`!`exclude substring filter) |
 | `--encode` | Base64 encode stdin, one line at a time |
 | `--decode` | Base64 decode stdin, one line at a time |
 | `--summary` | Per-project reports for Android Gradle projects found under `pattern` (a directory, defaults to `.`) — no device needed |

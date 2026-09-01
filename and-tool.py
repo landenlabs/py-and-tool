@@ -328,37 +328,99 @@ class ADBTool:
         print("Clearing logcat...")
         self._run_cmd(["logcat", "-c"], capture=False)
 
-    def trace(self):
-        """Show FATAL EXCEPTION crash traces, falling back to generic java errors."""
+    @staticmethod
+    def _parse_trace_filters(filters):
+        """Split raw --trace values into (include, exclude) substring lists; a leading '!' marks exclude."""
+        include, exclude = [], []
+        for raw in filters or []:
+            raw = raw.strip()
+            if not raw:
+                continue
+            if raw.startswith("!"):
+                exclude.append(raw[1:])
+            else:
+                include.append(raw)
+        return include, exclude
+
+    def trace(self, filters=None):
+        """Show FATAL EXCEPTION crash traces, deduped to the most recent occurrence of each, falling back to generic java errors."""
         print(colored("---- Show Traces ----", YELLOW))
         lines = self._run_cmd(["logcat", "-d"]).splitlines()
+        include, exclude = self._parse_trace_filters(filters)
 
+        traces = {}  # dedup signature -> {"header": str, "body": list, "count": int, "order": int}
+        order = []
         show = False
         proc_id = None
-        trace_count = 0
+        header = None
+        body = []
+
+        def signature(body_lines):
+            # PID varies run to run even for the identical crash, so ignore it when deduping.
+            return tuple(re.sub(r"PID:\s*\d+", "PID:<pid>", line) for line in body_lines)
+
+        def flush():
+            if header is None:
+                return
+            key = signature(body)
+            entry = traces.get(key)
+            if entry is None:
+                entry = {"count": 0, "order": len(order)}
+                traces[key] = entry
+                order.append(key)
+            entry["header"] = header
+            entry["body"] = body
+            entry["count"] += 1
 
         for line in lines:
             line = line.strip()
             if "FATAL EXCEPTION" in line:
-                trace_count += 1
+                flush()
                 show = True
                 parts = [p for p in line.split("FATAL")[0].split("E") if p]
                 proc_id = parts[-1] if parts else "_none_"
-                print(line)
+                header = line
+                body = []
             elif show and proc_id and proc_id in line:
                 parts = [p for p in line.split(proc_id) if p]
                 if len(parts) > 1:
-                    print(parts[1])
+                    body.append(parts[1])
             elif show:
-                print(colored("---- End Trace ----\n", YELLOW))
+                flush()
                 show = False
                 proc_id = None
+                header = None
+                body = []
+        flush()
 
-        if trace_count == 0:
+        def matches(entry):
+            haystack = entry["header"] + "\n" + "\n".join(entry["body"])
+            if include and not any(p in haystack for p in include):
+                return False
+            if exclude and any(p in haystack for p in exclude):
+                return False
+            return True
+
+        shown = 0
+        for key in order:
+            entry = traces[key]
+            if not matches(entry):
+                continue
+            shown += 1
+            if entry["count"] > 1:
+                print(colored(f"---- {entry['count']}x duplicate, showing most recent ----", YELLOW))
+            print(entry["header"])
+            for body_line in entry["body"]:
+                print(body_line)
+            print(colored("---- End Trace ----\n", YELLOW))
+
+        if not traces:
             print(colored("---- Show Error logs with 'java' ----", YELLOW))
             for line in self._run_cmd(["logcat", "-d", "*:E"]).splitlines():
                 if "java" in line:
                     print(line)
+        elif shown == 0:
+            print(colored("---- No traces matched the given --trace filter ----", YELLOW))
 
 
 def _get_apk_package_name(apk_path):
@@ -956,8 +1018,13 @@ def main():
             and-tool.py --stop-and-clear 'atak'
         Uninstall apps matching a pattern:
             and-tool.py --uninstall 'wx2'
-        Show recent crash traces from the attached device:
+        Show recent crash traces from the attached device, deduped to the most
+        recent occurrence of each (preceded by a count when duplicated); optionally
+        filter by a substring of the trace text (repeat --trace to OR multiple
+        include patterns, or prefix with '!' to exclude):
             and-tool.py --trace
+            and-tool.py --trace com.foo --trace com.bar
+            and-tool.py --trace "!com.foo"
         Clear device logs:
             and-tool.py --clear
         Base64 encode/decode stdin:
@@ -1007,14 +1074,27 @@ def main():
     )
 
     actions = parser.add_mutually_exclusive_group(required=False)
-    for name in ("uninstall", "packages", "info", "stop-and-clear", "clear", "trace", "encode", "decode", "list-apk", "list-aar", "list", "install", "summary"):
+    for name in ("uninstall", "packages", "info", "stop-and-clear", "clear", "encode", "decode", "list-apk", "list-aar", "list", "install", "summary"):
         if name == "info":
             help_text = "info action using adb, or aapt for a local .apk file (accepts any unambiguous prefix)"
-        elif name in ("uninstall", "packages", "stop-and-clear", "clear", "trace", "install"):
+        elif name in ("uninstall", "packages", "stop-and-clear", "clear", "install"):
             help_text = f"{name} action using adb (accepts any unambiguous prefix)"
         else:
             help_text = f"{name} action (accepts any unambiguous prefix)"
         actions.add_argument(f"--{name}", dest="action", action="store_const", const=name, help=help_text)
+    actions.add_argument(
+        "--trace",
+        dest="trace_filters",
+        nargs="?",
+        const="",
+        action="append",
+        default=None,
+        metavar="[!]PATTERN",
+        help="trace action using adb (accepts any unambiguous prefix): show FATAL EXCEPTION crash traces from logcat, "
+        "deduped to the most recent occurrence of each (preceded by a count when there were duplicates). Repeat "
+        "--trace PATTERN to only show traces whose text contains PATTERN (OR'd together), or --trace '!PATTERN' to "
+        "exclude traces containing PATTERN; include and exclude filters can be combined. With no PATTERN, shows all traces",
+    )
     actions.add_argument("--wifi-adb", dest="wifi_adb", choices=["on", "off"], help="Enable or disable adb over wifi on the connected device. Can be combined with --start to launch an app right after toggling")
     actions.add_argument(
         "--clean-gradle",
@@ -1034,7 +1114,7 @@ def main():
 
     args = parser.parse_args()
 
-    if not args.action and not args.start and not args.wifi_adb and args.clean_gradle_dirs is None:
+    if not args.action and not args.start and not args.wifi_adb and args.clean_gradle_dirs is None and args.trace_filters is None:
         parser.error("one of the action arguments is required")
     if args.start and args.action and args.action != "install":
         parser.error("--start can only be combined with --install")
@@ -1042,6 +1122,8 @@ def main():
         parser.error("only --summary accepts more than one directory argument")
     if args.clean_gradle_dirs is not None and args.patterns:
         parser.error("--clean-gradle takes its directories via repeated '--clean-gradle DIR', not positional arguments")
+    if args.trace_filters is not None and args.patterns:
+        parser.error("--trace takes its filters via repeated '--trace [!]PATTERN', not positional arguments")
 
     if args.clean_gradle_dirs is not None:
         return clean_gradle(args.clean_gradle_dirs)
@@ -1050,6 +1132,8 @@ def main():
         return do_encode()
     if args.action == "decode":
         return do_decode()
+    if args.trace_filters is not None:
+        return ADBTool().trace(args.trace_filters)
 
     pattern = args.patterns[0] if args.patterns else ""
 
@@ -1081,8 +1165,6 @@ def main():
         tool.stop_and_clear(pattern)
     elif args.action == "clear":
         tool.clear_logs()
-    elif args.action == "trace":
-        tool.trace()
     elif args.action == "install":
         pkg = tool.install(pattern)
         if pkg and args.start:
