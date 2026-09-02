@@ -222,6 +222,13 @@ class ADBTool:
                 print(f"Retrying install of {apk} ...")
                 output = self._install_apk(apk)
 
+                if "Success" not in output:
+                    answer = input(colored(f"Install still failed. Clear any remaining data for {pkg_name} and retry install? [y/N]: ", YELLOW)).strip().lower()
+                    if answer == "y":
+                        self._uninstall_pkg(pkg_name, clear_data=True)
+                        print(f"Retrying install of {apk} ...")
+                        output = self._install_apk(apk)
+
         return pkg_name if "Success" in output else None
 
     def start(self, pattern):
@@ -302,10 +309,12 @@ class ADBTool:
             return None
         return local_path
 
-    def _uninstall_pkg(self, pkg):
-        print(f"Stopping and clearing {pkg}...")
+    def _uninstall_pkg(self, pkg, clear_data=False):
+        print(f"Stopping {pkg}...")
         self._run_cmd(["shell", "am", "force-stop", pkg], capture=False)
-        self._run_cmd(["shell", "pm", "clear", "-a", pkg], capture=False)
+        if clear_data:
+            print(f"Clearing data for {pkg}...")
+            self._run_cmd(["shell", "pm", "clear", "-a", pkg], capture=False)
         print(f"Uninstalling {pkg}...")
         self._run_cmd(["shell", "pm", "uninstall", pkg], capture=False)
 
