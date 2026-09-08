@@ -454,16 +454,30 @@ def _find_sdk_tool(name):
     if tool:
         return tool
 
-    for sdk_root in (os.environ.get("ANDROID_HOME"), os.environ.get("ANDROID_SDK_ROOT"), os.path.expanduser("~/Library/Android/sdk")):
-        if not sdk_root:
+    sdk_roots = [os.environ.get("ANDROID_HOME"), os.environ.get("ANDROID_SDK_ROOT")]
+    if sys.platform == "win32":
+        local_appdata = os.environ.get("LOCALAPPDATA")
+        if local_appdata:
+            sdk_roots.append(os.path.join(local_appdata, "Android", "Sdk"))
+    else:
+        sdk_roots.append(os.path.expanduser("~/Library/Android/sdk"))
+
+    # apksigner ships as a shell script on Unix but a .bat on Windows; aapt/aapt2 get a .exe.
+    candidate_names = [name, name + ".exe"] if sys.platform == "win32" else [name]
+    if sys.platform == "win32" and name == "apksigner":
+        candidate_names = ["apksigner.bat"] + candidate_names
+
+    for sdk_root in sdk_roots:
+        if not sdk_root or not os.path.isdir(sdk_root):
             continue
         build_tools = os.path.join(sdk_root, "build-tools")
         if not os.path.isdir(build_tools):
             continue
         for version in sorted(os.listdir(build_tools), reverse=True):
-            candidate = os.path.join(build_tools, version, name)
-            if os.path.isfile(candidate):
-                return candidate
+            for candidate_name in candidate_names:
+                candidate = os.path.join(build_tools, version, candidate_name)
+                if os.path.isfile(candidate):
+                    return candidate
     return None
 
 
@@ -486,6 +500,36 @@ def _get_apk_signature(apk_path):
         return None
     digests = {line.rsplit(":", 1)[1].strip() for line in result.stdout.splitlines() if "SHA-256 digest" in line}
     return digests or None
+
+
+def _get_apk_manifest_flags(aapt, apk_path):
+    """Derives dumpsys-style pkgFlags (DEBUGGABLE, HAS_CODE, ALLOW_CLEAR_USER_DATA,
+    ALLOW_BACKUP, TEST_ONLY) from the manifest's <application> boolean attributes,
+    applying Android's documented defaults for any attribute that's absent."""
+    defaults = {"debuggable": False, "hasCode": True, "allowClearUserData": True, "allowBackup": True, "testOnly": False}
+    flag_names = {"debuggable": "DEBUGGABLE", "hasCode": "HAS_CODE", "allowClearUserData": "ALLOW_CLEAR_USER_DATA",
+                  "allowBackup": "ALLOW_BACKUP", "testOnly": "TEST_ONLY"}
+
+    result = subprocess.run([aapt, "dump", "xmltree", apk_path, "AndroidManifest.xml"], capture_output=True, text=True)
+    if result.returncode != 0:
+        return None
+
+    values = dict(defaults)
+    app_indent = None
+    for line in result.stdout.splitlines():
+        stripped = line.lstrip()
+        indent = len(line) - len(stripped)
+        if app_indent is None:
+            if stripped.startswith("E: application"):
+                app_indent = indent
+            continue
+        if stripped.startswith("E: ") and indent <= app_indent:
+            break
+        match = re.match(r"A: android:(\w+)\(0x[0-9a-fA-F]+\)=\(type 0x12\)(0x[0-9a-fA-F]+)", stripped)
+        if match and match.group(1) in defaults:
+            values[match.group(1)] = match.group(2) != "0x0"
+
+    return [flag_names[key] for key in flag_names if values[key]]
 
 
 def apk_info(apk_path):
@@ -531,6 +575,14 @@ def apk_info(apk_path):
     for line in lines:
         if re.search(r"(debug|native|testOnly|launchable)", line, re.IGNORECASE):
             print(f"    {line.strip()}")
+
+    signature = _get_apk_signature(apk_path)
+    if signature:
+        print(f"    signatures=[{', '.join(sorted(signature))}]")
+
+    flags = _get_apk_manifest_flags(aapt, apk_path)
+    if flags is not None:
+        print(f"    pkgFlags=[ {' '.join(flags)} ]")
 
 
 def _format_age(mtime_ts):
