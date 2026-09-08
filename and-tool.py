@@ -309,14 +309,30 @@ class ADBTool:
             return None
         return local_path
 
+    def _backup_enabled(self):
+        """Best-effort check of the device's Backup Manager state via 'bmgr enabled'.
+        Returns True/False, or None if the state can't be determined (e.g. bmgr
+        unavailable), in which case callers should skip warning rather than guess."""
+        output = self._run_cmd(["shell", "bmgr", "enabled"]).lower()
+        if "disabled" in output:
+            return False
+        if "enabled" in output:
+            return True
+        return None
+
     def _uninstall_pkg(self, pkg, clear_data=False):
         print(f"Stopping {pkg}...")
         self._run_cmd(["shell", "am", "force-stop", pkg], capture=False)
         if clear_data:
             print(f"Clearing data for {pkg}...")
             self._run_cmd(["shell", "pm", "clear", "-a", pkg], capture=False)
+        if self._backup_enabled() is False:
+            print(colored(f"Warning: device backup is disabled - {pkg}'s data will not be recoverable after this uninstall.", YELLOW))
         print(f"Uninstalling {pkg}...")
-        self._run_cmd(["shell", "pm", "uninstall", pkg], capture=False)
+        if clear_data:
+            self._run_cmd(["shell", "pm", "uninstall", pkg], capture=False)
+        else:
+            self._run_cmd(["shell", "pm", "uninstall", "-k", pkg], capture=False)
 
     def uninstall(self, pattern):
         for pkg in self._get_packages(pattern):
