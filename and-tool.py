@@ -21,7 +21,7 @@ import sys
 import tempfile
 import time
 from collections import Counter
-from datetime import datetime
+from datetime import datetime, timedelta
 
 VERSION = "v6.08.11"
 
@@ -446,6 +446,187 @@ class ADBTool:
                     print(line)
         elif shown == 0:
             print(colored("---- No traces matched the given --trace filter ----", YELLOW))
+
+
+# ---------------------------------------------------------------------------
+# --log-time: reformat a saved `adb logcat -v threadtime` file for readability
+# when diagnosing startup/UI-responsiveness delays
+# ---------------------------------------------------------------------------
+
+# Full `-v threadtime` line: 'MM-DD HH:MM:SS.mmm PID TID LEVEL TAG: msg'.
+_LOGCAT_LINE_RE = re.compile(
+    r'^(\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3})\s+(\d+)\s+(\d+)\s+([A-Z])\s+([^:]*):\s*(.*)$'
+)
+# Colorized wrappers (e.g. pidcat) often drop the date and PID, leaving just
+# 'HH:MM:SS.mmm TID LEVEL TAG: msg'.
+_LOGCAT_LINE_NO_PID_RE = re.compile(
+    r'^(\d{2}:\d{2}:\d{2}\.\d{3})\s+(\d+)\s+([A-Z])\s+([^:]*):\s*(.*)$'
+)
+# ALog's own tagStr() prefixes every message with 'Tmain#' or 'T<javaThreadId>#',
+# which lets us recover the thread name when there's no PID column to compare against.
+_TMAIN_MSG_RE = re.compile(r'^Tmain#')
+_TID_MSG_RE = re.compile(r'^T(\d+)#')
+
+_ANSI_ESCAPE_RE = re.compile(r'\x1b\[[0-9;]*[A-Za-z]')
+
+_LOG_LEVEL_COLORS = {"F": RED, "E": RED, "W": YELLOW, "I": CYAN}
+
+
+def _strip_ansi(line):
+    """Removes ANSI escape sequences (e.g. SGR color codes) so a pre-colored
+    log file still matches the plain logcat format."""
+    return _ANSI_ESCAPE_RE.sub("", line)
+
+
+def _msg_thread_hint(msg):
+    """Recovers a thread label from ALog's embedded 'Tmain#'/'T<id>#' message
+    prefix, or None if the message has no such prefix."""
+    if _TMAIN_MSG_RE.match(msg):
+        return "main"
+    match = _TID_MSG_RE.match(msg)
+    return match.group(1) if match else None
+
+
+def _parse_logcat_line(line):
+    """Parses one logcat line into a dict, or None if the line doesn't match
+    either the full `-v threadtime` format or the date/PID-less format some
+    colorized wrappers (e.g. pidcat) produce (e.g. logcat's own
+    '--------- beginning of main' markers match neither)."""
+    match = _LOGCAT_LINE_RE.match(line)
+    if match:
+        date_str, pid, tid, level, tag, msg = match.groups()
+        try:
+            # logcat's threadtime format omits the year; anchor to a fixed one and
+            # correct for a Dec->Jan rollover afterwards (see log_time).
+            ts = datetime.strptime(date_str + " 2001", "%m-%d %H:%M:%S.%f %Y")
+        except ValueError:
+            return None
+        thread = "main" if tid == pid else tid
+        return {"ts": ts, "thread": thread, "level": level, "tag": tag.strip(), "msg": msg}
+
+    match = _LOGCAT_LINE_NO_PID_RE.match(line)
+    if match:
+        time_str, tid, level, tag, msg = match.groups()
+        try:
+            ts = datetime.strptime(time_str, "%H:%M:%S.%f")
+        except ValueError:
+            return None
+        # Thread not yet resolved: this tid's name (if any line for it carries
+        # ALog's 'Tmain#'/'T<id>#' hint) is filled in across the whole file by
+        # log_time, so every line for a given tid gets the same label even if
+        # this particular message happens not to carry the hint itself.
+        return {"ts": ts, "tid": tid, "hint": _msg_thread_hint(msg), "level": level, "tag": tag.strip(), "msg": msg}
+
+    return None
+
+
+def _normalize_log_msg(msg):
+    """Blanks out numbers/addresses so otherwise-identical repeated log lines
+    (differing only by a counter, size, or object hash) compare equal."""
+    return re.sub(r'0x[0-9a-fA-F]+|@[0-9a-fA-F]{4,}|\d+', '#', msg)
+
+
+def _format_log_row(rec, base_ts, elapsed_width, thread_width):
+    elapsed = (rec["ts"] - base_ts).total_seconds()
+    line = f"+{elapsed:{elapsed_width}.3f} {rec['thread']:>{thread_width}} {rec['level']} {rec['tag']}: {rec['msg']}"
+    return colored(line, _LOG_LEVEL_COLORS[rec["level"]]) if rec["level"] in _LOG_LEVEL_COLORS else line
+
+
+def log_time(path, gap_seconds=1.0, collapse_min=5):
+    """Reformats a saved adb logcat file (full `-v threadtime`, or the date/PID-
+    less variant some colorized wrappers like pidcat produce) to make startup
+    delays easier to spot: the thread column becomes 'main' for the main
+    thread (via PID==TID, or -- when there's no PID column -- via ALog's own
+    embedded 'Tmain#'/'T<id>#' message prefix), the timestamp column becomes
+    an offset from the first line, a marker is inserted at any gap >=
+    gap_seconds, and runs of >= collapse_min consecutive lines that are
+    structurally identical (same thread/level/tag, message differing only by
+    numbers/addresses) are collapsed to their first and last entry. Any ANSI
+    color escape codes already in the file (e.g. from a pre-colored log) are
+    stripped before parsing."""
+    try:
+        with open(os.path.expanduser(path), encoding="utf-8", errors="replace") as f:
+            lines = [_strip_ansi(line) for line in f.readlines()]
+    except OSError as e:
+        print(colored(f"Error reading {path}: {e}", RED))
+        return
+
+    records = [_parse_logcat_line(line) or {"raw": line.rstrip("\n")} for line in lines]
+    matched = [r for r in records if "ts" in r]
+
+    # Correct for a Dec->Jan rollover: logcat's timestamp has no year, and all
+    # lines were parsed onto the same anchor year, so a later line whose clock
+    # time is far behind the previous one crossed into the following year.
+    prev_ts = None
+    year_bump = timedelta(days=0)
+    for rec in matched:
+        rec["ts"] += year_bump
+        if prev_ts is not None and rec["ts"] < prev_ts - timedelta(hours=12):
+            year_bump += timedelta(days=366)
+            rec["ts"] += timedelta(days=366)
+        prev_ts = rec["ts"]
+
+    if not matched:
+        print(colored(
+            f"No parseable logcat lines found in {path} "
+            "(expected 'adb logcat -v threadtime' format: 'MM-DD HH:MM:SS.mmm PID TID LEVEL TAG: msg', "
+            "or a colorized wrapper's 'HH:MM:SS.mmm TID LEVEL TAG: msg').",
+            RED,
+        ))
+        return
+
+    # Resolve the date/PID-less format's unresolved records: any line for a
+    # given tid that carried ALog's 'Tmain#'/'T<id>#' message hint names that
+    # tid for every line sharing it, not just the ones with the hint.
+    tid_names = {}
+    for rec in matched:
+        if "hint" in rec and rec["hint"] is not None:
+            tid_names.setdefault(rec["tid"], rec["hint"])
+    for rec in matched:
+        if "hint" in rec:
+            rec["thread"] = tid_names.get(rec["tid"], rec["tid"])
+
+    base_ts = matched[0]["ts"]
+    total_elapsed = (matched[-1]["ts"] - base_ts).total_seconds()
+    elapsed_width = len(str(int(total_elapsed))) + 4  # digits + '.' + 3 decimals
+    thread_width = max(len("main"), max(len(r["thread"]) for r in matched))
+    if collapse_min < 2:
+        collapse_min = len(records) + 1  # disabled: no run can ever be this long
+
+    def signature(rec):
+        return (rec["thread"], rec["level"], rec["tag"], _normalize_log_msg(rec["msg"]))
+
+    prev_ts = None
+    i, n = 0, len(records)
+    while i < n:
+        rec = records[i]
+        if "ts" not in rec:
+            print(rec["raw"])
+            i += 1
+            continue
+
+        if prev_ts is not None:
+            gap = (rec["ts"] - prev_ts).total_seconds()
+            if gap >= gap_seconds:
+                print(colored(f"\n----- GAP {gap:.3f}s -----\n", YELLOW))
+
+        sig = signature(rec)
+        j = i + 1
+        while j < n and "ts" in records[j] and signature(records[j]) == sig:
+            j += 1
+        run = records[i:j]
+
+        if len(run) >= collapse_min:
+            print(_format_log_row(run[0], base_ts, elapsed_width, thread_width))
+            span = (run[-1]["ts"] - run[0]["ts"]).total_seconds()
+            print(colored(f"    ... {len(run) - 2} similar lines omitted ({span:.3f}s) ...", CYAN))
+            print(_format_log_row(run[-1], base_ts, elapsed_width, thread_width))
+            prev_ts = run[-1]["ts"]
+            i = j
+        else:
+            print(_format_log_row(rec, base_ts, elapsed_width, thread_width))
+            prev_ts = rec["ts"]
+            i += 1
 
 
 def _get_apk_package_name(apk_path):
@@ -1144,6 +1325,16 @@ def main():
             and-tool.py --wifi-adb on
             and-tool.py --wifi-adb off
             and-tool.py --wifi-adb on --start full
+        Reformat a saved adb logcat file (full '-v threadtime', or the
+        date/PID-less format some colorized wrappers like pidcat produce;
+        ANSI color codes already in the file are stripped) to make startup/UI
+        delays easier to spot (no device required): shows 'main' for the main
+        thread, replaces the timestamp with an offset from the first line,
+        marks gaps, and collapses runs of near-identical lines to their
+        first/last entry:
+            and-tool.py --log-time ~/Downloads/log.txt
+            and-tool.py --log-time log.txt --gap-seconds 0.5
+            and-tool.py --log-time log.txt --collapse-min 0
 
     Action flags accept any unambiguous prefix, e.g. --info, --inf, --i
     """,
@@ -1183,15 +1374,28 @@ def main():
         metavar="DIR",
         help="clean-gradle action: scans DIR (default '.') one level deep for build.gradle projects and runs 'gradlew clean' in each; repeat --clean-gradle DIR to scan multiple directories",
     )
+    actions.add_argument(
+        "--log-time",
+        dest="log_time_path",
+        metavar="LOGFILE",
+        help="log-time action (no device required): reformats a saved adb logcat file (full '-v threadtime', or the "
+        "date/PID-less format some colorized wrappers like pidcat produce; any ANSI color codes already in the file "
+        "are stripped) to make startup/UI-responsiveness delays easier to spot -- shows the thread column as 'main' "
+        "for the main thread, replaces the timestamp column with an offset from the first line, marks gaps of "
+        "--gap-seconds or more, and collapses runs of --collapse-min or more consecutive structurally-identical "
+        "lines to their first/last entry",
+    )
 
     parser.add_argument("patterns", nargs="*", default=[], help="Partial package name (substring match, case-insensitive), a path to a local .apk file for --info/--install, a directory to search for --list/--list-apk/--list-aar/--install (defaults to '.'), one or more directories to search for --summary (defaults to '.'), or a partial .apk filename for --install. Defaults to matching every installed package")
     parser.add_argument("--start", action="store_true", help="Launch an installed app using adb, matching pattern. With --install, launches the just-installed apk instead of matching pattern against installed packages. Alone with no pattern, installs an apk found under '.' first, then launches it")
     parser.add_argument("--verbose", "-v", action="store_true", help="With --info, show fuller dumpsys breakdown: activities, permissions, flags")
+    parser.add_argument("--gap-seconds", type=float, default=1.0, metavar="SECS", help="With --log-time, mark gaps of at least SECS between consecutive log lines (default 1.0)")
+    parser.add_argument("--collapse-min", type=int, default=5, metavar="N", help="With --log-time, collapse runs of at least N consecutive structurally-identical log lines (default 5); use 0 to disable collapsing")
     parser.add_argument("--version", "-V", action="version", version=f"and-tool {VERSION}")
 
     args = parser.parse_args()
 
-    if not args.action and not args.start and not args.wifi_adb and args.clean_gradle_dirs is None and args.trace_filters is None:
+    if not args.action and not args.start and not args.wifi_adb and args.clean_gradle_dirs is None and args.trace_filters is None and not args.log_time_path:
         parser.error("one of the action arguments is required")
     if args.start and args.action and args.action != "install":
         parser.error("--start can only be combined with --install")
@@ -1201,6 +1405,8 @@ def main():
         parser.error("--clean-gradle takes its directories via repeated '--clean-gradle DIR', not positional arguments")
     if args.trace_filters is not None and args.patterns:
         parser.error("--trace takes its filters via repeated '--trace [!]PATTERN', not positional arguments")
+    if args.log_time_path and args.patterns:
+        parser.error("--log-time takes its file via '--log-time LOGFILE', not positional arguments")
 
     if args.clean_gradle_dirs is not None:
         return clean_gradle(args.clean_gradle_dirs)
@@ -1211,6 +1417,8 @@ def main():
         return do_decode()
     if args.trace_filters is not None:
         return ADBTool().trace(args.trace_filters)
+    if args.log_time_path:
+        return log_time(args.log_time_path, gap_seconds=args.gap_seconds, collapse_min=args.collapse_min)
 
     pattern = args.patterns[0] if args.patterns else ""
 
