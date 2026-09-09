@@ -353,6 +353,51 @@ class ADBTool:
         print("Clearing logcat...")
         self._run_cmd(["logcat", "-c"], capture=False)
 
+    def _get_pids(self, partial_name):
+        """Retrieves (pid, name) pairs from `ps -A` whose process name contains
+        partial_name (case-insensitive substring); a process name is usually the
+        package name, but can be suffixed (e.g. 'pkg:service') for a named process."""
+        lines = self._run_cmd(["shell", "ps", "-A"]).splitlines()
+        needle = partial_name.lower()
+        matches = []
+        for line in lines[1:]:  # skip header
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            pid, name = parts[1], parts[-1]
+            if needle in name.lower():
+                matches.append((pid, name))
+        return matches
+
+    def log_pid(self, pattern):
+        """Finds running process(es) matching pattern (case-insensitive substring
+        of process name via `ps -A`), prompting to choose when more than one
+        matches, then dumps that process's log via `adb logcat --pid=<pid> -d`."""
+        matches = self._get_pids(pattern)
+        if not matches:
+            print(colored(f"No running process matches '{pattern}'.", RED))
+            return
+
+        if len(matches) == 1:
+            pid, name = matches[0]
+        else:
+            print(colored("--- Multiple processes found ---", YELLOW))
+            for i, (pid, name) in enumerate(matches, 1):
+                print(f"  {i}  {name} (pid {pid})")
+            choice = input(f"Enter # (1..{len(matches)}): ").strip()
+            try:
+                idx = int(choice)
+                if not 1 <= idx <= len(matches):
+                    raise ValueError
+            except ValueError:
+                print(colored("Invalid selection.", RED))
+                return
+            pid, name = matches[idx - 1]
+
+        print(colored(f"---- Log for {name} (pid {pid}) ----", CYAN))
+        for line in self._run_cmd(["logcat", f"--pid={pid}", "-d"]).splitlines():
+            print(_colorize_logcat_line(line))
+
     @staticmethod
     def _parse_trace_filters(filters):
         """Split raw --trace values into (include, exclude) substring lists; a leading '!' marks exclude."""
@@ -471,11 +516,24 @@ _ANSI_ESCAPE_RE = re.compile(r'\x1b\[[0-9;]*[A-Za-z]')
 
 _LOG_LEVEL_COLORS = {"F": RED, "E": RED, "W": YELLOW, "I": CYAN}
 
+# Default (`-v brief`) logcat format: 'LEVEL/TAG(PID): msg', e.g. 'I/ActivityManager( 1234): ...'.
+_LOGCAT_BRIEF_LEVEL_RE = re.compile(r'^([A-Z])/')
+
 
 def _strip_ansi(line):
     """Removes ANSI escape sequences (e.g. SGR color codes) so a pre-colored
     log file still matches the plain logcat format."""
     return _ANSI_ESCAPE_RE.sub("", line)
+
+
+def _colorize_logcat_line(line):
+    """Colors a raw (`-v brief` format) logcat line by its level, same palette
+    as --log-time (F/E red, W yellow, I cyan); lines with no recognized level
+    prefix (D/V, or a wrapped stack-trace continuation line) print unchanged."""
+    match = _LOGCAT_BRIEF_LEVEL_RE.match(line)
+    if match and match.group(1) in _LOG_LEVEL_COLORS:
+        return colored(line, _LOG_LEVEL_COLORS[match.group(1)])
+    return line
 
 
 def _msg_thread_hint(msg):
@@ -1335,6 +1393,10 @@ def main():
             and-tool.py --log-time ~/Downloads/log.txt
             and-tool.py --log-time log.txt --gap-seconds 0.5
             and-tool.py --log-time log.txt --collapse-min 0
+        Dump the logcat for a running process, matched by partial package/process
+        name; prompts with a numbered list to choose when more than one process
+        matches:
+            and-tool.py --log-pid drop.red
 
     Action flags accept any unambiguous prefix, e.g. --info, --inf, --i
     """,
@@ -1364,6 +1426,14 @@ def main():
         "exclude traces containing PATTERN; include and exclude filters can be combined. With no PATTERN, shows all traces",
     )
     actions.add_argument("--wifi-adb", dest="wifi_adb", choices=["on", "off"], help="Enable or disable adb over wifi on the connected device. Can be combined with --start to launch an app right after toggling")
+    actions.add_argument(
+        "--log-pid",
+        dest="log_pid_pattern",
+        metavar="PARTIAL_PKG_NAME",
+        help="log-pid action using adb: finds running process(es) whose name contains PARTIAL_PKG_NAME "
+        "(case-insensitive substring, via 'adb shell ps -A'), prompting to choose by number when more than "
+        "one matches, then dumps that process's log via 'adb logcat --pid=<pid> -d'",
+    )
     actions.add_argument(
         "--clean-gradle",
         dest="clean_gradle_dirs",
@@ -1395,7 +1465,8 @@ def main():
 
     args = parser.parse_args()
 
-    if not args.action and not args.start and not args.wifi_adb and args.clean_gradle_dirs is None and args.trace_filters is None and not args.log_time_path:
+    if (not args.action and not args.start and not args.wifi_adb and args.clean_gradle_dirs is None
+            and args.trace_filters is None and not args.log_time_path and not args.log_pid_pattern):
         parser.error("one of the action arguments is required")
     if args.start and args.action and args.action != "install":
         parser.error("--start can only be combined with --install")
@@ -1419,6 +1490,8 @@ def main():
         return ADBTool().trace(args.trace_filters)
     if args.log_time_path:
         return log_time(args.log_time_path, gap_seconds=args.gap_seconds, collapse_min=args.collapse_min)
+    if args.log_pid_pattern:
+        return ADBTool().log_pid(args.log_pid_pattern)
 
     pattern = args.patterns[0] if args.patterns else ""
 
