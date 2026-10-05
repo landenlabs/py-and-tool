@@ -13,6 +13,7 @@ packages() implementation.
 import argparse
 import base64
 import glob
+import hashlib
 import os
 import re
 import shutil
@@ -192,30 +193,35 @@ class ADBTool:
 
     def install(self, target):
         """Installs an apk, returning the installed package name on success, or
-        None if resolution failed, the user declined, or the install ultimately failed."""
+        None if resolution failed, the user declined, or the install ultimately failed.
+        If the installed apk is byte-for-byte identical to the on-disk apk, skips the
+        install entirely."""
         apk = _resolve_apk_to_install(target)
         if not apk:
             return None
 
         pkg_name = _get_apk_package_name(apk)
         installed = bool(pkg_name and pkg_name in self._get_packages(pkg_name))
-        sig_mismatch = installed and self._signatures_differ(pkg_name, apk)
+        identical = sig_mismatch = False
+        if installed:
+            identical, sig_mismatch = self._compare_installed_apk(pkg_name, apk)
 
         if installed:
             print(colored(f"Existing install of {pkg_name}:", CYAN))
             self.info(pkg_name, verbose=False)
+            if identical:
+                print(colored(f"Installed {pkg_name} is identical to {apk} - skipping install.", CYAN))
+                return pkg_name
             if sig_mismatch:
                 print(colored(f"Signing certificate differs from the installed {pkg_name} - a plain install would fail.", RED))
             answer = input(colored(f"Install {apk} over existing {pkg_name}? [y/N]: ", YELLOW)).strip().lower()
             if answer != "y":
                 print("Skipping install.")
                 return None
-            if sig_mismatch:
-                self._uninstall_pkg(pkg_name)
 
         print(f"Installing {apk} ...")
         output = self._install_apk(apk)
-        if "Success" not in output and pkg_name and not sig_mismatch:
+        if "Success" not in output and pkg_name:
             answer = input(colored(f"Install failed. Uninstall existing {pkg_name} and retry install? [y/N]: ", YELLOW)).strip().lower()
             if answer == "y":
                 self._uninstall_pkg(pkg_name)
@@ -275,23 +281,28 @@ class ADBTool:
         print(output)
         return output
 
-    def _signatures_differ(self, pkg_name, apk):
-        """Best-effort pre-check: pulls the installed apk and compares its signing
-        cert(s) against the candidate apk via apksigner. Returns False (assume no
-        mismatch) if apksigner or the pulled apk is unavailable, leaving the normal
-        install-then-retry-on-failure flow in install() as the fallback."""
+    def _compare_installed_apk(self, pkg_name, apk):
+        """Pulls the installed apk for pkg_name and compares it against the candidate
+        apk. Returns (identical, sig_mismatch): identical is True if the two apks are
+        byte-for-byte the same, in which case sig_mismatch is always False since a
+        same-apk install can't fail on signing; sig_mismatch is True if their signing
+        cert(s) differ (a plain install would fail). Both default to False (best-effort)
+        if the installed apk can't be pulled or the relevant tool is unavailable,
+        leaving the normal install-then-retry-on-failure flow in install() as the
+        fallback."""
         installed_apk = self._pull_installed_apk(pkg_name)
         if not installed_apk:
-            return False
+            return False, False
         try:
+            if _files_identical(installed_apk, apk):
+                return True, False
             old_sig = _get_apk_signature(installed_apk)
             new_sig = _get_apk_signature(apk)
         finally:
             os.remove(installed_apk)
 
-        if old_sig is None or new_sig is None:
-            return False
-        return old_sig != new_sig
+        sig_mismatch = old_sig is not None and new_sig is not None and old_sig != new_sig
+        return False, sig_mismatch
 
     def _pull_installed_apk(self, pkg_name):
         """Pulls the installed base apk for pkg_name to a temp file; returns its
@@ -323,9 +334,6 @@ class ADBTool:
     def _uninstall_pkg(self, pkg, clear_data=False):
         print(f"Stopping {pkg}...")
         self._run_cmd(["shell", "am", "force-stop", pkg], capture=False)
-        if clear_data:
-            print(f"Clearing data for {pkg}...")
-            self._run_cmd(["shell", "pm", "clear", "-a", pkg], capture=False)
         if self._backup_enabled() is False:
             print(colored(f"Warning: device backup is disabled - {pkg}'s data will not be recoverable after this uninstall.", YELLOW))
         print(f"Uninstalling {pkg}...")
@@ -755,6 +763,22 @@ def _get_apk_signature(apk_path):
         return None
     digests = {line.rsplit(":", 1)[1].strip() for line in result.stdout.splitlines() if "SHA-256 digest" in line}
     return digests or None
+
+
+def _files_identical(path_a, path_b):
+    """Returns True if two files are byte-for-byte identical, comparing size first
+    then SHA-256 digest."""
+    if os.path.getsize(path_a) != os.path.getsize(path_b):
+        return False
+    return _sha256_file(path_a) == _sha256_file(path_b)
+
+
+def _sha256_file(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _get_apk_manifest_flags(aapt, apk_path):
@@ -1363,9 +1387,11 @@ def main():
             and-tool.py --clean-gradle dir1 --clean-gradle dir2
         Install an apk (searches and prompts if there are multiple matches; if the
         apk's package is already installed, shows its --info summary and asks to
-        confirm. If the installed and new apk are signed with different certs,
-        confirming uninstalls the old copy first instead of waiting for adb install
-        to fail; otherwise, on an install failure, offers to uninstall and retry):
+        confirm. If the installed apk is byte-for-byte identical to the on-disk apk,
+        skips the install instead of prompting. If the installed and new apk are
+        signed with different certs, confirming uninstalls the old copy first instead
+        of waiting for adb install to fail; otherwise, on an install failure, offers
+        to uninstall and retry):
             and-tool.py --install
             and-tool.py --install build/
             and-tool.py --install debug
