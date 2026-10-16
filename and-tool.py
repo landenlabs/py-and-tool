@@ -16,6 +16,7 @@ import glob
 import hashlib
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -41,9 +42,16 @@ class ADBTool:
         self.adb_cmd = ["adb"]
         self._setup_device()
 
-    def _run_cmd(self, args, capture=True):
-        """Helper to run shell commands."""
+    @staticmethod
+    def _echo_cmd(cmd):
+        """Prints the actual command line about to run (shell-quoted so it can be copy/pasted)."""
+        print(colored("$ " + " ".join(shlex.quote(c) for c in cmd), CYAN))
+
+    def _run_cmd(self, args, capture=True, echo=False):
+        """Helper to run shell commands. echo=True prints the full adb command first."""
         full_cmd = self.adb_cmd + args
+        if echo:
+            self._echo_cmd(full_cmd)
         try:
             result = subprocess.run(full_cmd, capture_output=capture, text=True)
             return result.stdout.strip() if capture else None
@@ -252,7 +260,7 @@ class ADBTool:
         """Launches pkg's default activity via the monkey trick, avoiding the need
         to know its launch activity's class name."""
         print(f"Starting {pkg} ...")
-        self._run_cmd(["shell", "monkey", "-p", pkg, "-c", "android.intent.category.LAUNCHER", "1"], capture=False)
+        self._run_cmd(["shell", "monkey", "-p", pkg, "-c", "android.intent.category.LAUNCHER", "1"], capture=False, echo=True)
 
     def wifi_adb(self, enable):
         """Toggles adb-over-wifi on the connected device. Enabling switches adbd
@@ -266,17 +274,21 @@ class ADBTool:
                 return
             addr = match.group(1)
             print(f"Switching {' '.join(self.adb_cmd)} to tcpip mode on port 5555...")
-            self._run_cmd(["tcpip", "5555"], capture=False)
+            self._run_cmd(["tcpip", "5555"], capture=False, echo=True)
             time.sleep(1)
             print(f"Connecting to {addr}:5555 ...")
-            subprocess.run(["adb", "connect", f"{addr}:5555"])
+            connect_cmd = ["adb", "connect", f"{addr}:5555"]
+            self._echo_cmd(connect_cmd)
+            subprocess.run(connect_cmd)
         else:
             print(f"Switching {' '.join(self.adb_cmd)} back to USB mode...")
-            self._run_cmd(["usb"], capture=False)
+            self._run_cmd(["usb"], capture=False, echo=True)
 
     def _install_apk(self, apk):
         """Runs adb install, printing and returning its combined stdout+stderr."""
-        result = subprocess.run(self.adb_cmd + ["install", "-r", "-t", "-d", "-i", "com.android.vending", apk], capture_output=True, text=True)
+        cmd = self.adb_cmd + ["install", "-r", "-t", "-d", "-i", "com.android.vending", apk]
+        self._echo_cmd(cmd)
+        result = subprocess.run(cmd, capture_output=True, text=True)
         output = (result.stdout + result.stderr).strip()
         print(output)
         return output
@@ -314,7 +326,9 @@ class ADBTool:
 
         fd, local_path = tempfile.mkstemp(suffix=".apk")
         os.close(fd)
-        result = subprocess.run(self.adb_cmd + ["pull", device_path, local_path], capture_output=True, text=True)
+        cmd = self.adb_cmd + ["pull", device_path, local_path]
+        self._echo_cmd(cmd)
+        result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0 or os.path.getsize(local_path) == 0:
             os.remove(local_path)
             return None
@@ -333,14 +347,14 @@ class ADBTool:
 
     def _uninstall_pkg(self, pkg, clear_data=False):
         print(f"Stopping {pkg}...")
-        self._run_cmd(["shell", "am", "force-stop", pkg], capture=False)
+        self._run_cmd(["shell", "am", "force-stop", pkg], capture=False, echo=True)
         if self._backup_enabled() is False:
             print(colored(f"Warning: device backup is disabled - {pkg}'s data will not be recoverable after this uninstall.", YELLOW))
         print(f"Uninstalling {pkg}...")
         if clear_data:
-            self._run_cmd(["shell", "pm", "uninstall", pkg], capture=False)
+            self._run_cmd(["shell", "pm", "uninstall", pkg], capture=False, echo=True)
         else:
-            self._run_cmd(["shell", "pm", "uninstall", "-k", pkg], capture=False)
+            self._run_cmd(["shell", "pm", "uninstall", "-k", pkg], capture=False, echo=True)
 
     def uninstall(self, pattern):
         for pkg in self._get_packages(pattern):
@@ -353,13 +367,13 @@ class ADBTool:
     def stop_and_clear(self, pattern):
         for pkg in self._get_packages(pattern):
             print(f"== Processing {pkg}")
-            self._run_cmd(["shell", "am", "force-stop", pkg], capture=False)
-            self._run_cmd(["shell", "pm", "clear", "--user", "0", pkg], capture=False)
-            self._run_cmd(["shell", "am", "start", "-a", "android.settings.APPLICATION_DETAILS_SETTINGS", "-d", f"package:{pkg}"], capture=False)
+            self._run_cmd(["shell", "am", "force-stop", pkg], capture=False, echo=True)
+            self._run_cmd(["shell", "pm", "clear", "--user", "0", pkg], capture=False, echo=True)
+            self._run_cmd(["shell", "am", "start", "-a", "android.settings.APPLICATION_DETAILS_SETTINGS", "-d", f"package:{pkg}"], capture=False, echo=True)
 
     def clear_logs(self):
         print("Clearing logcat...")
-        self._run_cmd(["logcat", "-c"], capture=False)
+        self._run_cmd(["logcat", "-c"], capture=False, echo=True)
 
     def _get_pids(self, partial_name):
         """Retrieves (pid, name) pairs from `ps -A` whose process name contains
@@ -403,7 +417,7 @@ class ADBTool:
             pid, name = matches[idx - 1]
 
         print(colored(f"---- Log for {name} (pid {pid}) ----", CYAN))
-        for line in self._run_cmd(["logcat", f"--pid={pid}", "-d"]).splitlines():
+        for line in self._run_cmd(["logcat", f"--pid={pid}", "-d"], echo=True).splitlines():
             print(_colorize_logcat_line(line))
 
     @staticmethod
