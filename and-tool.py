@@ -37,6 +37,28 @@ def colored(msg, color):
     return f"{color}{msg}{RESET}"
 
 
+def _play_prompt_sound():
+    """Best-effort non-blocking alert sound when waiting for keyboard input."""
+    try:
+        if sys.platform == "darwin":
+            subprocess.Popen(["afplay", "/System/Library/Sounds/Ping.aiff"],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        elif sys.platform == "win32":
+            import winsound
+            winsound.MessageBeep(winsound.MB_ICONASTERISK)
+        elif sys.stdout.isatty():
+            sys.stdout.write("\a")
+            sys.stdout.flush()
+    except Exception:
+        pass
+
+
+def ask(prompt=""):
+    """input() that first plays a sound to get the user's attention."""
+    _play_prompt_sound()
+    return input(prompt)
+
+
 class ADBTool:
     def __init__(self):
         self.adb_cmd = ["adb"]
@@ -72,7 +94,7 @@ class ADBTool:
             for i, dev in enumerate(devices, 1):
                 print(f"  {i}  {dev}")
             try:
-                choice = int(input(f"Enter device # (1..{len(devices)}): "))
+                choice = int(ask(f"Enter device # (1..{len(devices)}): "))
                 self.adb_cmd = ["adb", "-s", devices[choice - 1]]
             except (ValueError, IndexError):
                 print(colored("Invalid selection.", RED))
@@ -222,7 +244,7 @@ class ADBTool:
                 return pkg_name
             if sig_mismatch:
                 print(colored(f"Signing certificate differs from the installed {pkg_name} - a plain install would fail.", RED))
-            answer = input(colored(f"Install {apk} over existing {pkg_name}? [y/N]: ", YELLOW)).strip().lower()
+            answer = ask(colored(f"Install {apk} over existing {pkg_name}? [y/N]: ", YELLOW)).strip().lower()
             if answer != "y":
                 print("Skipping install.")
                 return None
@@ -230,14 +252,14 @@ class ADBTool:
         print(f"Installing {apk} ...")
         output = self._install_apk(apk)
         if "Success" not in output and pkg_name:
-            answer = input(colored(f"Install failed. Uninstall existing {pkg_name} and retry install? [y/N]: ", YELLOW)).strip().lower()
+            answer = ask(colored(f"Install failed. Uninstall existing {pkg_name} and retry install? [y/N]: ", YELLOW)).strip().lower()
             if answer == "y":
                 self._uninstall_pkg(pkg_name)
                 print(f"Retrying install of {apk} ...")
                 output = self._install_apk(apk)
 
                 if "Success" not in output:
-                    answer = input(colored(f"Install still failed. Clear any remaining data for {pkg_name} and retry install? [y/N]: ", YELLOW)).strip().lower()
+                    answer = ask(colored(f"Install still failed. Clear any remaining data for {pkg_name} and retry install? [y/N]: ", YELLOW)).strip().lower()
                     if answer == "y":
                         self._uninstall_pkg(pkg_name, clear_data=True)
                         print(f"Retrying install of {apk} ...")
@@ -358,7 +380,7 @@ class ADBTool:
 
     def uninstall(self, pattern):
         for pkg in self._get_packages(pattern):
-            answer = input(colored(f"Uninstall {pkg}? [y/N]: ", YELLOW)).strip().lower()
+            answer = ask(colored(f"Uninstall {pkg}? [y/N]: ", YELLOW)).strip().lower()
             if answer != "y":
                 print(f"Skipping {pkg}")
                 continue
@@ -406,7 +428,7 @@ class ADBTool:
             print(colored("--- Multiple processes found ---", YELLOW))
             for i, (pid, name) in enumerate(matches, 1):
                 print(f"  {i}  {name} (pid {pid})")
-            choice = input(f"Enter # (1..{len(matches)}): ").strip()
+            choice = ask(f"Enter # (1..{len(matches)}): ").strip()
             try:
                 idx = int(choice)
                 if not 1 <= idx <= len(matches):
@@ -949,7 +971,7 @@ def _prompt_apk_choice(matches):
     print(colored("--- Multiple APKs found (oldest first, newest last) ---", YELLOW))
     for i, path in enumerate(matches, 1):
         print(f"  {i}  {path}")
-    choice = input(f"Enter # (1..{len(matches)}), or 'n' for newest: ").strip().lower()
+    choice = ask(f"Enter # (1..{len(matches)}), or 'n' for newest: ").strip().lower()
     if choice == "n":
         return matches[-1]
     try:
@@ -967,7 +989,7 @@ def _prompt_pkg_choice(matches):
     print(colored("--- Multiple packages found ---", YELLOW))
     for i, pkg in enumerate(matches, 1):
         print(f"  {i}  {pkg}")
-    choice = input(f"Enter # (1..{len(matches)}): ").strip()
+    choice = ask(f"Enter # (1..{len(matches)}): ").strip()
     try:
         idx = int(choice)
         if 1 <= idx <= len(matches):
