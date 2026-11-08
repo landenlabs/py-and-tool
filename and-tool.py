@@ -239,6 +239,8 @@ class ADBTool:
         if installed:
             print(colored(f"Existing install of {pkg_name}:", CYAN))
             self.info(pkg_name, verbose=False)
+            print(colored("New apk to install:", CYAN))
+            apk_install_summary(apk)
             if identical:
                 print(colored(f"Installed {pkg_name} is identical to {apk} - skipping install.", CYAN))
                 return pkg_name
@@ -801,6 +803,71 @@ def _get_apk_signature(apk_path):
     return digests or None
 
 
+def _java_bytes_hash(data):
+    """Java's Arrays.hashCode(byte[]) (signed bytes, 32-bit wraparound), which is what
+    android.content.pm.Signature.hashCode() returns for a cert's DER encoding."""
+    h = 1
+    for b in data:
+        h = (31 * h + (b - 256 if b > 127 else b)) & 0xFFFFFFFF
+    return h
+
+
+def _get_apk_signature_short_hashes(apk_path):
+    """Returns the signing certs of apk_path as the short hex hashes dumpsys shows in
+    'PackageSignatures{... signatures:[e0c7068c]}', so they can be compared by eye.
+    Uses `apksigner verify --print-certs-pem`; None if unavailable."""
+    apksigner = _find_apksigner()
+    if not apksigner:
+        return None
+    result = subprocess.run([apksigner, "verify", "--print-certs-pem", apk_path], capture_output=True, text=True)
+    if result.returncode != 0:
+        return None
+    pems = re.findall(r"-----BEGIN CERTIFICATE-----(.*?)-----END CERTIFICATE-----", result.stdout, re.DOTALL)
+    hashes = []
+    for pem in pems:
+        short = "%x" % _java_bytes_hash(base64.b64decode("".join(pem.split())))
+        if short not in hashes:
+            hashes.append(short)
+    return hashes or None
+
+
+def apk_install_summary(apk_path):
+    """Prints a local .apk's details in the same shape as info()'s dumpsys summary
+    (package, versionName, signatures, pkgFlags, file info) so the existing install
+    and the new apk can be compared line by line."""
+    aapt = _find_aapt()
+    pkg = version_name = version_code = None
+    if aapt:
+        result = subprocess.run([aapt, "dump", "badging", apk_path], capture_output=True, text=True)
+        for line in result.stdout.splitlines():
+            if line.startswith("package:"):
+                fields = dict(re.findall(r"(\w+)='([^']*)'", line))
+                pkg, version_name, version_code = fields.get("name"), fields.get("versionName"), fields.get("versionCode")
+                break
+
+    print(colored(f"---- {pkg or os.path.basename(apk_path)} ----", CYAN))
+    if pkg:
+        print(f"  Package [{pkg}]")
+    if version_name is not None:
+        print(f"  versionName={version_name}  versionCode={version_code}")
+    short_sigs = _get_apk_signature_short_hashes(apk_path)
+    if short_sigs:
+        print(f"  signatures=[{', '.join(short_sigs)}]")
+    else:
+        digests = _get_apk_signature(apk_path)
+        if digests:
+            print(f"  signatures(SHA-256)=[{', '.join(sorted(digests))}]")
+    if aapt:
+        flags = _get_apk_manifest_flags(aapt, apk_path)
+        if flags is not None:
+            print(f"  pkgFlags=[ {' '.join(flags)} ]")
+    st = os.stat(apk_path)
+    print(f"  File info: File: {os.path.abspath(apk_path)}")
+    print(f"  Size: {st.st_size}")
+    print(f"Modify: {datetime.fromtimestamp(st.st_mtime).astimezone().strftime('%Y-%m-%d %H:%M:%S %z')}")
+    print()
+
+
 def _files_identical(path_a, path_b):
     """Returns True if two files are byte-for-byte identical, comparing size first
     then SHA-256 digest."""
@@ -821,9 +888,11 @@ def _get_apk_manifest_flags(aapt, apk_path):
     """Derives dumpsys-style pkgFlags (DEBUGGABLE, HAS_CODE, ALLOW_CLEAR_USER_DATA,
     ALLOW_BACKUP, TEST_ONLY) from the manifest's <application> boolean attributes,
     applying Android's documented defaults for any attribute that's absent."""
-    defaults = {"debuggable": False, "hasCode": True, "allowClearUserData": True, "allowBackup": True, "testOnly": False}
+    defaults = {"debuggable": False, "hasCode": True, "allowClearUserData": True, "allowBackup": True, "testOnly": False,
+                "killAfterRestore": True}
+    # Ordered by ApplicationInfo flag bit value, matching dumpsys's pkgFlags order.
     flag_names = {"debuggable": "DEBUGGABLE", "hasCode": "HAS_CODE", "allowClearUserData": "ALLOW_CLEAR_USER_DATA",
-                  "allowBackup": "ALLOW_BACKUP", "testOnly": "TEST_ONLY"}
+                  "testOnly": "TEST_ONLY", "allowBackup": "ALLOW_BACKUP", "killAfterRestore": "KILL_AFTER_RESTORE"}
 
     result = subprocess.run([aapt, "dump", "xmltree", apk_path, "AndroidManifest.xml"], capture_output=True, text=True)
     if result.returncode != 0:
@@ -844,6 +913,8 @@ def _get_apk_manifest_flags(aapt, apk_path):
         if match and match.group(1) in defaults:
             values[match.group(1)] = match.group(2) != "0x0"
 
+    # Android only honors killAfterRestore when backup is allowed.
+    values["killAfterRestore"] = values["killAfterRestore"] and values["allowBackup"]
     return [flag_names[key] for key in flag_names if values[key]]
 
 
